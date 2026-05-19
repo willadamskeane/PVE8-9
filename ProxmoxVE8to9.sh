@@ -248,9 +248,11 @@ check_ceph() {
     die "PVE-managed Ceph configuration detected, but the ceph command is not available. Verify Ceph health/version manually before upgrading."
   fi
 
-  local ceph_version ceph_major
+  local ceph_version ceph_version_number ceph_major ceph_minor
   ceph_version="$(ceph --version 2>/dev/null || true)"
-  ceph_major="$(awk '{print $3}' <<<"$ceph_version" | cut -d. -f1)"
+  ceph_version_number="$(awk '{print $3}' <<<"$ceph_version")"
+  ceph_major="$(cut -d. -f1 <<<"$ceph_version_number")"
+  ceph_minor="$(cut -d. -f2 <<<"$ceph_version_number")"
 
   if [[ -z "$ceph_version" ]]; then
     die "PVE-managed Ceph is detected but version could not be determined. Verify Ceph health/version manually before upgrading."
@@ -258,7 +260,11 @@ check_ceph() {
 
   log "Detected ${ceph_version}"
 
-  if [[ "$ceph_major" != "19" ]]; then
+  if ! [[ "$ceph_major" =~ ^[0-9]+$ && "$ceph_minor" =~ ^[0-9]+$ ]]; then
+    die "Could not parse PVE-managed Ceph version. Verify Ceph is Squid 19.2 before upgrading. Detected: ${ceph_version}"
+  fi
+
+  if [[ "$ceph_major" != "19" || "$ceph_minor" -lt 2 ]]; then
     die "Hyper-converged Ceph must be upgraded to Ceph Squid 19.2 before PVE 9. Detected: ${ceph_version}"
   fi
 }
@@ -338,6 +344,24 @@ comment_file() {
   sed_in_place 's/^[[:space:]]*deb /# disabled by pve8to9 helper: deb /' "$file"
 }
 
+comment_matching_list_lines() {
+  local file="$1"
+  local pattern="$2"
+  local tmp
+
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+  awk -v pattern="$pattern" '
+    /^[[:space:]]*deb[[:space:]]/ && $0 ~ pattern {
+      print "# disabled by pve8to9 helper: " $0
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
 apt_source_files() {
   [[ -f "$APT_SOURCES_LIST" ]] && printf '%s\0' "$APT_SOURCES_LIST"
   [[ -d "$APT_SOURCES_DIR" ]] && find "$APT_SOURCES_DIR" -type f \( -name '*.list' -o -name '*.sources' \) -print0
@@ -362,12 +386,50 @@ disable_source_file() {
   fi
 }
 
+disable_matching_deb822_stanzas() {
+  local file="$1"
+  local pattern="$2"
+  local disabled_file="${file}.disabled-by-pve8to9"
+  local tmp
+
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+  : > "$disabled_file"
+
+  awk -v pattern="$pattern" -v disabled_file="$disabled_file" '
+    BEGIN { RS = ""; ORS = "" }
+    {
+      stanza = $0
+      sub(/[[:space:]]+$/, "", stanza)
+      if (stanza ~ pattern) {
+        print stanza "\n\n" >> disabled_file
+      } else {
+        print stanza "\n\n"
+      }
+    }
+  ' "$file" > "$tmp"
+
+  if grep -q '[^[:space:]]' "$tmp"; then
+    cat "$tmp" > "$file"
+  else
+    rm -f "$file"
+  fi
+
+  rm -f "$tmp"
+}
+
 disable_legacy_pve_sources() {
   local file
+  local pve_repo_pattern='enterprise\.proxmox\.com/debian/pve|download\.proxmox\.com/debian/pve'
+
   while IFS= read -r -d '' file; do
-    if grep -Eq 'enterprise\.proxmox\.com/debian/pve|download\.proxmox\.com/debian/pve' "$file"; then
+    if grep -Eq "$pve_repo_pattern" "$file"; then
       log "Disabling legacy PVE repository entries in ${file}."
-      disable_source_file "$file"
+      if [[ "$file" == *.sources ]]; then
+        disable_matching_deb822_stanzas "$file" "$pve_repo_pattern"
+      else
+        comment_matching_list_lines "$file" "$pve_repo_pattern"
+      fi
     fi
   done < <(apt_source_files)
 }
@@ -483,13 +545,15 @@ EOF
 
 disable_backports() {
   local file
+  local backports_pattern='(^[[:space:]]*deb .*backports|^[[:space:]]*Suites:[[:space:]].*backports)'
+
   while IFS= read -r -d '' file; do
-    if grep -Eq '(^[[:space:]]*deb .*backports|^[[:space:]]*Suites:[[:space:]].*backports)' "$file"; then
+    if grep -Eq "$backports_pattern" "$file"; then
       warn "Disabling backports repository in ${file}; Proxmox does not test this upgrade with backports."
       if [[ "$file" == *.sources ]]; then
-        disable_source_file "$file"
+        disable_matching_deb822_stanzas "$file" 'Suites:[[:space:]].*backports'
       else
-        sed_in_place 's/^[[:space:]]*deb \(.*backports.*\)$/# disabled by pve8to9 helper: deb \1/' "$file"
+        comment_matching_list_lines "$file" 'backports'
       fi
     fi
   done < <(apt_source_files)

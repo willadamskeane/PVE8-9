@@ -121,6 +121,73 @@ EOF
   assert_file_exists "${APT_SOURCES_DIR}/debian-backports.sources.disabled-by-pve8to9"
 }
 
+test_mixed_list_only_disables_legacy_pve_lines() {
+  reset_fixture "mixed-list-pve"
+  load_script
+
+  cat > "$APT_SOURCES_LIST" <<'EOF'
+deb http://deb.debian.org/debian trixie main contrib
+deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription
+deb http://security.debian.org/debian-security trixie-security main contrib
+EOF
+
+  disable_legacy_pve_sources
+
+  assert_file_contains "$APT_SOURCES_LIST" '^deb http://deb\.debian\.org/debian trixie main contrib$'
+  assert_file_contains "$APT_SOURCES_LIST" '^# disabled by pve8to9 helper: deb http://download\.proxmox\.com/debian/pve bookworm pve-no-subscription$'
+  assert_file_contains "$APT_SOURCES_LIST" '^deb http://security\.debian\.org/debian-security trixie-security main contrib$'
+}
+
+test_mixed_deb822_only_disables_legacy_pve_stanza() {
+  reset_fixture "mixed-deb822-pve"
+  load_script
+
+  cat > "${APT_SOURCES_DIR}/mixed.sources" <<'EOF'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie
+Components: main contrib
+
+Types: deb
+URIs: http://download.proxmox.com/debian/pve
+Suites: bookworm
+Components: pve-no-subscription
+EOF
+
+  disable_legacy_pve_sources
+
+  assert_file_exists "${APT_SOURCES_DIR}/mixed.sources"
+  assert_file_exists "${APT_SOURCES_DIR}/mixed.sources.disabled-by-pve8to9"
+  assert_file_contains "${APT_SOURCES_DIR}/mixed.sources" '^URIs: http://deb\.debian\.org/debian$'
+  assert_file_not_contains "${APT_SOURCES_DIR}/mixed.sources" 'download\.proxmox\.com/debian/pve'
+  assert_file_contains "${APT_SOURCES_DIR}/mixed.sources.disabled-by-pve8to9" '^URIs: http://download\.proxmox\.com/debian/pve$'
+}
+
+test_mixed_deb822_only_disables_backports_stanza() {
+  reset_fixture "mixed-deb822-backports"
+  load_script
+
+  cat > "${APT_SOURCES_DIR}/debian.sources" <<'EOF'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie
+Components: main contrib
+
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie-backports
+Components: main contrib
+EOF
+
+  disable_backports
+
+  assert_file_exists "${APT_SOURCES_DIR}/debian.sources"
+  assert_file_exists "${APT_SOURCES_DIR}/debian.sources.disabled-by-pve8to9"
+  assert_file_contains "${APT_SOURCES_DIR}/debian.sources" '^Suites: trixie$'
+  assert_file_not_contains "${APT_SOURCES_DIR}/debian.sources" 'trixie-backports'
+  assert_file_contains "${APT_SOURCES_DIR}/debian.sources.disabled-by-pve8to9" '^Suites: trixie-backports$'
+}
+
 test_ceph_client_only_host_is_not_blocked() {
   reset_fixture "ceph-client-only"
   load_script
@@ -155,6 +222,26 @@ EOF
   fi
 }
 
+test_pve_managed_ceph_blocks_pre_squid_minor() {
+  reset_fixture "pve-managed-ceph-pre-squid"
+  load_script
+
+  mkdir -p "$PVE_CONFIG_DIR"
+  : > "${PVE_CONFIG_DIR}/ceph.conf"
+
+  local bin_dir="${FIXTURE_DIR}/bin"
+  mkdir -p "$bin_dir"
+  cat > "${bin_dir}/ceph" <<'EOF'
+#!/usr/bin/env bash
+echo "ceph version 19.1.0"
+EOF
+  chmod +x "${bin_dir}/ceph"
+
+  if (PATH="${bin_dir}:${PATH}" check_ceph); then
+    fail "expected PVE-managed Ceph 19.1 to block upgrade"
+  fi
+}
+
 test_pve_managed_ceph_accepts_squid() {
   reset_fixture "pve-managed-ceph-squid"
   load_script
@@ -178,8 +265,12 @@ main() {
     test_third_party_bookworm_list_is_disabled_not_rewritten
     test_third_party_bookworm_deb822_is_moved_not_rewritten
     test_deb822_backports_is_disabled
+    test_mixed_list_only_disables_legacy_pve_lines
+    test_mixed_deb822_only_disables_legacy_pve_stanza
+    test_mixed_deb822_only_disables_backports_stanza
     test_ceph_client_only_host_is_not_blocked
     test_pve_managed_ceph_blocks_old_major
+    test_pve_managed_ceph_blocks_pre_squid_minor
     test_pve_managed_ceph_accepts_squid
   )
 
