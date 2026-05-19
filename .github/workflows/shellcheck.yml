@@ -20,4 +20,7 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck ProxmoxVE8to9.sh
+        run: shellcheck ProxmoxVE8to9.sh tests/run.sh
+
+      - name: Run regression tests
+        run: bash tests/run.sh

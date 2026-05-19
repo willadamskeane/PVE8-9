@@ -8,7 +8,13 @@ set -Eeuo pipefail
 SCRIPT_VERSION="2.0.0"
 TARGET_SUITE="trixie"
 SOURCE_SUITE="bookworm"
-LOG_FILE="/var/log/pve8to9-upgrade-helper.log"
+LOG_FILE="${LOG_FILE:-/var/log/pve8to9-upgrade-helper.log}"
+APT_SOURCES_LIST="${APT_SOURCES_LIST:-/etc/apt/sources.list}"
+APT_SOURCES_DIR="${APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+APT_BACKUP_BASE_DIR="${APT_BACKUP_BASE_DIR:-/root}"
+PVE_CONFIG_DIR="${PVE_CONFIG_DIR:-/etc/pve}"
+COROSYNC_CONFIG="${COROSYNC_CONFIG:-/etc/corosync/corosync.conf}"
+CEPH_CONFIG_FILE="${CEPH_CONFIG_FILE:-/etc/ceph/ceph.conf}"
 
 ASSUME_YES=0
 CHECK_ONLY=0
@@ -86,6 +92,17 @@ confirm() {
 run() {
   log "+ $*"
   "$@"
+}
+
+sed_in_place() {
+  local expression="$1"
+  local file="$2"
+
+  if sed --version >/dev/null 2>&1; then
+    sed -i "$expression" "$file"
+  else
+    sed -i '' "$expression" "$file"
+  fi
 }
 
 parse_args() {
@@ -212,7 +229,7 @@ EOF
 }
 
 check_cluster() {
-  if [[ -f /etc/corosync/corosync.conf ]]; then
+  if [[ -f "$COROSYNC_CONFIG" ]]; then
     warn "Cluster configuration detected. Upgrade one node at a time and keep the cluster healthy between nodes."
     run pvecm status || warn "pvecm status reported issues. Resolve cluster health before upgrading."
     if ! confirm "Confirm this node has been drained/migrated as needed and the cluster is healthy."; then
@@ -222,9 +239,13 @@ check_cluster() {
 }
 
 check_ceph() {
-  if ! command -v ceph >/dev/null 2>&1; then
-    log "Ceph command not found; skipping Ceph version check."
+  if ! pve_managed_ceph_detected; then
+    log "No PVE-managed local Ceph configuration detected; skipping hyper-converged Ceph version gate."
     return 0
+  fi
+
+  if ! command -v ceph >/dev/null 2>&1; then
+    die "PVE-managed Ceph configuration detected, but the ceph command is not available. Verify Ceph health/version manually before upgrading."
   fi
 
   local ceph_version ceph_major
@@ -232,8 +253,7 @@ check_ceph() {
   ceph_major="$(awk '{print $3}' <<<"$ceph_version" | cut -d. -f1)"
 
   if [[ -z "$ceph_version" ]]; then
-    warn "Ceph is installed but version could not be detected. Verify manually before upgrading."
-    return 0
+    die "PVE-managed Ceph is detected but version could not be determined. Verify Ceph health/version manually before upgrading."
   fi
 
   log "Detected ${ceph_version}"
@@ -298,15 +318,15 @@ select_repositories() {
 
 backup_apt_sources() {
   local backup_dir
-  backup_dir="/root/pve8to9-apt-sources-backup-$(date '+%Y%m%d-%H%M%S')"
+  backup_dir="${APT_BACKUP_BASE_DIR}/pve8to9-apt-sources-backup-$(date '+%Y%m%d-%H%M%S')"
   run mkdir -p "$backup_dir"
 
-  if [[ -f /etc/apt/sources.list ]]; then
-    run cp -a /etc/apt/sources.list "$backup_dir/"
+  if [[ -f "$APT_SOURCES_LIST" ]]; then
+    run cp -a "$APT_SOURCES_LIST" "$backup_dir/"
   fi
 
-  if [[ -d /etc/apt/sources.list.d ]]; then
-    run cp -a /etc/apt/sources.list.d "$backup_dir/"
+  if [[ -d "$APT_SOURCES_DIR" ]]; then
+    run cp -a "$APT_SOURCES_DIR" "$backup_dir/"
   fi
 
   success "Backed up APT sources to ${backup_dir}."
@@ -315,7 +335,31 @@ backup_apt_sources() {
 comment_file() {
   local file="$1"
   [[ -f "$file" ]] || return 0
-  sed -i 's/^[[:space:]]*deb /# disabled by pve8to9 helper: deb /' "$file"
+  sed_in_place 's/^[[:space:]]*deb /# disabled by pve8to9 helper: deb /' "$file"
+}
+
+apt_source_files() {
+  [[ -f "$APT_SOURCES_LIST" ]] && printf '%s\0' "$APT_SOURCES_LIST"
+  [[ -d "$APT_SOURCES_DIR" ]] && find "$APT_SOURCES_DIR" -type f \( -name '*.list' -o -name '*.sources' \) -print0
+}
+
+is_official_debian_source() {
+  local file="$1"
+  grep -Eiq '(^|[[:space:]])(https?://)?([a-z0-9.-]+\.)?(debian\.org|debian\.net)/debian(-security)?/?([[:space:]]|$)|^[[:space:]]*URIs:[[:space:]].*(debian\.org|debian\.net)/debian(-security)?' "$file"
+}
+
+is_proxmox_source() {
+  local file="$1"
+  grep -Eiq 'enterprise\.proxmox\.com/debian/(pve|ceph-|pbs)|download\.proxmox\.com/debian/(pve|ceph-|pbs)' "$file"
+}
+
+disable_source_file() {
+  local file="$1"
+  if [[ "$file" == *.sources ]]; then
+    run mv "$file" "${file}.disabled-by-pve8to9"
+  else
+    comment_file "$file"
+  fi
 }
 
 disable_legacy_pve_sources() {
@@ -323,29 +367,52 @@ disable_legacy_pve_sources() {
   while IFS= read -r -d '' file; do
     if grep -Eq 'enterprise\.proxmox\.com/debian/pve|download\.proxmox\.com/debian/pve' "$file"; then
       log "Disabling legacy PVE repository entries in ${file}."
-      if [[ "$file" == *.sources ]]; then
-        run mv "$file" "${file}.disabled-by-pve8to9"
-      else
-        comment_file "$file"
-      fi
+      disable_source_file "$file"
     fi
-  done < <(find /etc/apt/sources.list /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+  done < <(apt_source_files)
 }
 
-replace_suite_in_apt_sources() {
+replace_debian_suite_in_apt_sources() {
   local file
   while IFS= read -r -d '' file; do
-    if grep -q "$SOURCE_SUITE" "$file"; then
+    if grep -q "$SOURCE_SUITE" "$file" && is_official_debian_source "$file"; then
       log "Updating Debian suite names in ${file}."
-      sed -i "s/${SOURCE_SUITE}/${TARGET_SUITE}/g" "$file"
+      sed_in_place "s/${SOURCE_SUITE}/${TARGET_SUITE}/g" "$file"
     fi
-  done < <(find /etc/apt/sources.list /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+  done < <(apt_source_files)
+}
+
+handle_third_party_bookworm_sources() {
+  local file
+  local files=()
+
+  while IFS= read -r -d '' file; do
+    if grep -q "$SOURCE_SUITE" "$file" && ! is_official_debian_source "$file" && ! is_proxmox_source "$file"; then
+      files+=("$file")
+    fi
+  done < <(apt_source_files)
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  warn "Found third-party Bookworm APT sources. Proxmox requires third-party repositories/packages to be verified for Debian Trixie compatibility before upgrading."
+  printf '  %s\n' "${files[@]}" | tee -a "$LOG_FILE" >&2
+
+  if confirm "Disable these third-party Bookworm sources now?"; then
+    for file in "${files[@]}"; do
+      log "Disabling third-party Bookworm source ${file}."
+      disable_source_file "$file"
+    done
+  else
+    die "Review or disable third-party Bookworm sources before repository migration."
+  fi
 }
 
 write_pve_repository() {
   case "$PVE_REPO" in
     enterprise)
-      cat > /etc/apt/sources.list.d/pve-enterprise.sources <<EOF
+      cat > "${APT_SOURCES_DIR}/pve-enterprise.sources" <<EOF
 Types: deb
 URIs: https://enterprise.proxmox.com/debian/pve
 Suites: trixie
@@ -354,7 +421,7 @@ Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 EOF
       ;;
     no-subscription)
-      cat > /etc/apt/sources.list.d/proxmox.sources <<EOF
+      cat > "${APT_SOURCES_DIR}/proxmox.sources" <<EOF
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
 Suites: trixie
@@ -366,7 +433,11 @@ EOF
 }
 
 ceph_repo_needed() {
-  command -v ceph >/dev/null 2>&1 || [[ -f /etc/apt/sources.list.d/ceph.list ]] || [[ -f /etc/apt/sources.list.d/ceph.sources ]]
+  pve_managed_ceph_detected || [[ -f "${APT_SOURCES_DIR}/ceph.list" ]] || [[ -f "${APT_SOURCES_DIR}/ceph.sources" ]]
+}
+
+pve_managed_ceph_detected() {
+  [[ -f "${PVE_CONFIG_DIR}/ceph.conf" ]] || [[ -f "$CEPH_CONFIG_FILE" && -d "${PVE_CONFIG_DIR}/priv/ceph" ]]
 }
 
 write_ceph_repository() {
@@ -385,7 +456,7 @@ write_ceph_repository() {
 
   case "$CEPH_REPO" in
     enterprise)
-      cat > /etc/apt/sources.list.d/ceph.sources <<EOF
+      cat > "${APT_SOURCES_DIR}/ceph.sources" <<EOF
 Types: deb
 URIs: https://enterprise.proxmox.com/debian/ceph-squid
 Suites: trixie
@@ -394,7 +465,7 @@ Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 EOF
       ;;
     no-subscription)
-      cat > /etc/apt/sources.list.d/ceph.sources <<EOF
+      cat > "${APT_SOURCES_DIR}/ceph.sources" <<EOF
 Types: deb
 URIs: http://download.proxmox.com/debian/ceph-squid
 Suites: trixie
@@ -404,26 +475,31 @@ EOF
       ;;
   esac
 
-  if [[ -f /etc/apt/sources.list.d/ceph.list ]]; then
+  if [[ -f "${APT_SOURCES_DIR}/ceph.list" ]]; then
     log "Disabling legacy Ceph list repository."
-    comment_file /etc/apt/sources.list.d/ceph.list
+    comment_file "${APT_SOURCES_DIR}/ceph.list"
   fi
 }
 
 disable_backports() {
   local file
   while IFS= read -r -d '' file; do
-    if grep -Eq '^[[:space:]]*deb .*backports' "$file"; then
+    if grep -Eq '(^[[:space:]]*deb .*backports|^[[:space:]]*Suites:[[:space:]].*backports)' "$file"; then
       warn "Disabling backports repository in ${file}; Proxmox does not test this upgrade with backports."
-      sed -i 's/^[[:space:]]*deb \(.*backports.*\)$/# disabled by pve8to9 helper: deb \1/' "$file"
+      if [[ "$file" == *.sources ]]; then
+        disable_source_file "$file"
+      else
+        sed_in_place 's/^[[:space:]]*deb \(.*backports.*\)$/# disabled by pve8to9 helper: deb \1/' "$file"
+      fi
     fi
-  done < <(find /etc/apt/sources.list /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+  done < <(apt_source_files)
 }
 
 configure_repositories() {
   select_repositories
   backup_apt_sources
-  replace_suite_in_apt_sources
+  handle_third_party_bookworm_sources
+  replace_debian_suite_in_apt_sources
   disable_legacy_pve_sources
   write_pve_repository
   write_ceph_repository
@@ -549,4 +625,6 @@ EOF
   success "Upgrade helper completed. Clear the browser cache and verify the web UI after reboot."
 }
 
-main "$@"
+if [[ "${PVE8TO9_SOURCE_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi

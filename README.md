@@ -34,6 +34,9 @@ The official upgrade path is:
 - Checks local Ceph version when Ceph is installed.
 - Runs the official `pve8to9 --full` checker before and after the upgrade.
 - Backs up current APT source files under `/root`.
+- Rewrites only official Debian repository suites from Bookworm to Trixie.
+- Disables third-party Bookworm repositories unless you choose to stop and review them manually.
+- Disables backports repositories, including deb822 `.sources` files.
 - Writes Proxmox VE 9 repository files in deb822 format.
 - Supports either `enterprise` or `no-subscription` Proxmox repositories.
 - Supports Ceph Squid `enterprise`, `no-subscription`, `auto`, or `none` repository handling.
@@ -47,6 +50,7 @@ The official upgrade path is:
 - It does not run the main distribution upgrade with `DEBIAN_FRONTEND=noninteractive`.
 - It does not promise a zero-touch production upgrade.
 - It does not replace the official `pve8to9` checker or Proxmox documentation.
+- It does not automatically rewrite third-party repositories to Trixie.
 
 ## Requirements
 
@@ -153,9 +157,10 @@ Local checks:
 
 ```bash
 bash -n ProxmoxVE8to9.sh
+bash tests/run.sh
 ```
 
-CI runs ShellCheck on pull requests and pushes.
+CI runs ShellCheck and the regression test suite on pull requests and pushes.
 
 ## License
 
