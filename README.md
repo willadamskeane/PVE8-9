@@ -1,313 +1,162 @@
 # PVE8-9
-# Proxmox VE Upgrade Scripts
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Shell Script](https://img.shields.io/badge/Shell-Bash-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Proxmox VE](https://img.shields.io/badge/Proxmox-VE-E57000?logo=proxmox&logoColor=white)](https://www.proxmox.com/en/proxmox-ve)
+Proxmox VE 8 to 9 upgrade helper for operators who want a guided, auditable command-line flow while still following the official Proxmox upgrade process.
 
-Automated scripts for upgrading Proxmox Virtual Environment between major versions with comprehensive safety checks and error handling.
+This repository is intentionally small: one Bash helper, documentation, and CI syntax/lint checks. The helper does not try to hide the upgrade behind unsafe automation. It keeps `apt dist-upgrade` interactive so package configuration prompts can be reviewed deliberately.
 
-## ⚠️ **CRITICAL DISCLAIMERS - READ BEFORE USE**
+## Current Guidance
 
-### 🚨 USE AT YOUR OWN RISK 🚨
+Last reviewed: 2026-05-19.
 
-**THIS SCRIPT PERFORMS MAJOR SYSTEM MODIFICATIONS THAT CAN RENDER YOUR SYSTEM UNBOOTABLE OR CAUSE DATA LOSS.**
+Primary references:
 
-- **NOT RESPONSIBLE FOR ANY DATA LOSS, SYSTEM DAMAGE, OR DOWNTIME**
-- **NO WARRANTY PROVIDED - USE ENTIRELY AT YOUR OWN RISK**
-- **ALWAYS TEST IN DEVELOPMENT ENVIRONMENT FIRST**
-- **NEVER RUN ON PRODUCTION WITHOUT EXTENSIVE TESTING**
-- **ENSURE COMPLETE BACKUPS BEFORE PROCEEDING**
+- [Official Proxmox VE 8 to 9 upgrade guide](https://pve.proxmox.com/wiki/Upgrade_from_8_to_9)
+- [Proxmox VE package repository documentation](https://pve.proxmox.com/pve-docs/pve-package-repos-plain.html)
+- [Proxmox VE 9.1 release announcement](https://www.proxmox.com/en/about/company-details/press-releases/proxmox-virtual-environment-9-1)
+- [Debian 13 Trixie release notes](https://www.debian.org/releases/trixie/)
 
-### 🧪 **MANDATORY TESTING REQUIREMENTS**
+The official upgrade path is:
 
-Before using this script on ANY production system:
+1. Upgrade each node to the latest Proxmox VE 8.4 packages.
+2. Run `pve8to9 --full` and resolve blocking issues.
+3. Move Debian and Proxmox repositories from Bookworm to Trixie using current deb822 `.sources` files.
+4. Run `apt dist-upgrade`.
+5. Run `pve8to9 --full` again.
+6. Reboot into the Proxmox VE 9 kernel and verify the host.
 
-1. **Set up an identical test environment**
-2. **Run the script on test systems multiple times**
-3. **Verify all your VMs and containers work post-upgrade**
-4. **Document any issues and solutions**
-5. **Only then consider using on production with proper maintenance windows**
+## What This Helper Does
 
-## 📋 Overview
+- Checks that it is running as root on a Proxmox VE host.
+- Verifies free root filesystem space.
+- Warns when running over SSH without `tmux` or `screen`.
+- Requires backup and console-access confirmation.
+- Detects clusters and reminds you to upgrade one node at a time.
+- Checks local Ceph version when Ceph is installed.
+- Runs the official `pve8to9 --full` checker before and after the upgrade.
+- Backs up current APT source files under `/root`.
+- Writes Proxmox VE 9 repository files in deb822 format.
+- Supports either `enterprise` or `no-subscription` Proxmox repositories.
+- Supports Ceph Squid `enterprise`, `no-subscription`, `auto`, or `none` repository handling.
+- Leaves `apt dist-upgrade` interactive.
+- Logs actions to `/var/log/pve8to9-upgrade-helper.log`.
 
-This repository contains automated upgrade scripts for Proxmox Virtual Environment (PVE) that help transition between major versions while maintaining system integrity and minimizing downtime.
+## What This Helper Does Not Do
 
-### Current Scripts
+- It does not patch out Proxmox subscription UI notices.
+- It does not force no-subscription repositories over enterprise repositories.
+- It does not run the main distribution upgrade with `DEBIAN_FRONTEND=noninteractive`.
+- It does not promise a zero-touch production upgrade.
+- It does not replace the official `pve8to9` checker or Proxmox documentation.
 
-- **`proxmox-8to9-upgrade.sh`** - Upgrades Proxmox VE 8.x to 9.x (Debian Bookworm → Trixie)
+## Requirements
 
-## ✨ Features
+- Proxmox VE 8.x host, with 8.4.x required before repository migration.
+- Root shell.
+- Reliable network access.
+- At least 5 GiB free on `/`, ideally more than 10 GiB.
+- Console, IPMI, iKVM, physical access, or an SSH session protected by `tmux`/`screen`.
+- Tested backups of all guests and host configuration.
+- For hyper-converged Ceph, Ceph Squid 19.2 before the Proxmox VE 9 upgrade.
 
-- 🔍 **Pre-flight System Checks** - Network, disk space, dependencies
-- 🛡️ **Safety Mechanisms** - Multiple confirmation prompts and backup reminders
-- 📝 **Comprehensive Logging** - Detailed progress tracking and error reporting
-- 🔧 **Automatic Repository Management** - Handles Debian and Proxmox repository transitions
-- 💾 **Configuration Backup** - Automatic backup of critical configurations
-- 🖥️ **UEFI/BIOS Support** - Handles both boot methods and fixes common issues
-- 🔄 **Kernel Management** - Ensures proper kernel installation and boot configuration
-- ✅ **Post-Upgrade Verification** - Validates successful upgrade completion
-- 📱 **Cluster Awareness** - Detects and provides guidance for cluster environments
-- 🚨 **Error Recovery** - Comprehensive error handling with recovery guidance
+## Usage
 
-## 🛠️ Prerequisites
-
-### System Requirements
-
-- Proxmox VE 8.x installation (8.4.x recommended)
-- Root access to the system
-- Stable internet connection
-- At least 5GB free disk space
-- Console access (IPMI/iLO recommended for production)
-
-### Essential Pre-Upgrade Steps
-
-1. **Complete System Backup**
-   ```bash
-   # Backup all VMs and containers
-   vzdump --all --storage <backup-storage> --mode snapshot
-   
-   # Backup configuration
-   tar -czf /tmp/pve-config-backup.tar.gz /etc/pve/ /etc/network/interfaces /etc/hosts
-   ```
-
-2. **Update to Latest PVE 8.4.x**
-   ```bash
-   apt update && apt dist-upgrade
-   pveversion  # Should show 8.4.x
-   ```
-
-3. **Ceph Users** (if applicable)
-   ```bash
-   # Upgrade Ceph to Squid before PVE upgrade
-   # Follow: https://pve.proxmox.com/wiki/Ceph_Reef_to_Squid
-   ```
-
-## 📦 Installation
-
-### Method 1: Direct Download (Recommended)
+Download and run the helper from your fork:
 
 ```bash
-# Download the script
-wget https://raw.githubusercontent.com/YOUR-USERNAME/proxmox-upgrade-scripts/main/scripts/proxmox-8to9-upgrade.sh
-
-# Make executable
-chmod +x proxmox-8to9-upgrade.sh
-
-# Verify download integrity (optional but recommended)
-sha256sum proxmox-8to9-upgrade.sh
+wget https://raw.githubusercontent.com/willadamskeane/PVE8-9/main/ProxmoxVE8to9.sh
+chmod +x ProxmoxVE8to9.sh
+sudo ./ProxmoxVE8to9.sh --check-only
+sudo ./ProxmoxVE8to9.sh --pve-repo enterprise --ceph-repo enterprise
 ```
 
-### Method 2: Clone Repository
+For a no-subscription lab or home host:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/proxmox-upgrade-scripts.git
-cd proxmox-upgrade-scripts/scripts
-chmod +x proxmox-8to9-upgrade.sh
+sudo ./ProxmoxVE8to9.sh --pve-repo no-subscription --ceph-repo auto
 ```
 
-## 🚀 Usage
-
-### For Testing Environments
+For SSH-based work, use a terminal multiplexer:
 
 ```bash
-# Run directly for testing
-./proxmox-8to9-upgrade.sh
+tmux new -s pve8to9
+sudo ./ProxmoxVE8to9.sh --pve-repo enterprise --ceph-repo auto
 ```
 
-### For Production Environments
-
-**ALWAYS use tmux or screen to prevent SSH disconnection issues:**
+Show all options:
 
 ```bash
-# Start tmux session
-tmux new-session -d -s pve-upgrade
-
-# Attach to session
-tmux attach-session -t pve-upgrade
-
-# Run the upgrade script
-./proxmox-8to9-upgrade.sh
-
-# If disconnected, reconnect with:
-# tmux attach-session -t pve-upgrade
+sudo ./ProxmoxVE8to9.sh --help
 ```
 
-### Cluster Environments
+## Recommended Manual Preflight
 
-**Upgrade nodes ONE AT A TIME:**
+Before using any helper script, run:
 
 ```bash
-# Node 1: Run upgrade, wait for completion and verification
-./proxmox-8to9-upgrade.sh
-
-# Wait for node to be fully operational
-# Verify cluster status: pvecm status
-
-# Only then proceed to Node 2, then Node 3, etc.
+apt update
+apt dist-upgrade
+pveversion
+pve8to9 --full
 ```
 
-## 🔧 Post-Upgrade Verification
+The `pveversion` output should show Proxmox VE 8.4.x before the repository migration. Resolve warnings from `pve8to9 --full` before continuing.
 
-After the script completes, verify your system:
+For clusters:
 
 ```bash
-# Check versions
-uname -r          # Should show 6.14.x-pve kernel
-pveversion        # Should show 9.x.x
-
-# Check services
-systemctl status pve-cluster pvedaemon pveproxy
-
-# Clear browser cache and test web interface
-# Press Ctrl+Shift+R in browser
-
-# Test VMs and containers
-qm list           # List VMs
-pct list          # List containers
-
-# Start any stopped VMs/containers
-qm start <vmid>
-pct start <ctid>
-
-# Check logs for issues
-journalctl -xe
-```
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-#### GRUB/Boot Issues
-```bash
-# Fix UEFI boot problems
-echo 'grub-efi-amd64 grub2/force_efi_extra_removable boolean true' | debconf-set-selections -v
-apt install --reinstall grub-efi-amd64
-```
-
-#### Kernel Not Loading
-```bash
-# Check available kernels
-ls /boot/vmlinuz-*
-
-# Ensure GRUB is updated
-update-grub
-
-# Reboot if new kernel available
-reboot
-```
-
-#### Service Issues
-```bash
-# Restart PVE services
-systemctl restart pve-cluster pvedaemon pveproxy
-
-# Check cluster status (if applicable)
 pvecm status
 ```
 
-#### Package Conflicts
-```bash
-# Fix broken packages
-apt --fix-broken install
+Drain or migrate workloads away from the node being upgraded where needed. Upgrade nodes one at a time.
 
-# Complete interrupted upgrade
-apt dist-upgrade
-```
-
-### Recovery Procedures
-
-If the upgrade fails:
-
-1. **Check current status:**
-   ```bash
-   pveversion
-   systemctl status pve-cluster pvedaemon pveproxy
-   ```
-
-2. **Attempt to complete upgrade:**
-   ```bash
-   apt update
-   apt dist-upgrade
-   ```
-
-3. **If system is broken:**
-   - Boot from rescue media
-   - Restore from backups
-   - Contact Proxmox support if you have a subscription
-
-## 📚 Additional Resources
-
-- [Official Proxmox VE 8 to 9 Upgrade Guide](https://pve.proxmox.com/wiki/Upgrade_from_8_to_9)
-- [Proxmox VE Documentation](https://pve.proxmox.com/pve-docs/)
-- [Proxmox Community Forum](https://forum.proxmox.com/)
-- [Debian Trixie Release Notes](https://www.debian.org/releases/trixie/)
-
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these guidelines:
-
-1. **Test thoroughly** in lab environments
-2. **Document changes** clearly
-3. **Follow bash best practices**
-4. **Include error handling**
-5. **Update documentation** as needed
-
-### Development Workflow
+For Ceph:
 
 ```bash
-# Fork the repository
-# Create feature branch
-git checkout -b feature/improvement-name
-
-# Make changes and test extensively
-# Commit with clear messages
-git commit -m "feat: add improved error handling for X"
-
-# Push and create pull request
-git push origin feature/improvement-name
+ceph --version
 ```
 
-## 📄 License
+Do not start the Proxmox VE 9 upgrade until hyper-converged Ceph is on Squid 19.2.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+## Post-Upgrade Verification
 
-## ⚠️ Final Warnings
+After the upgrade and reboot:
 
-### Before Using This Script
+```bash
+uname -r
+pveversion
+pve8to9 --full
+systemctl status pve-cluster pvedaemon pveproxy
+qm list
+pct list
+journalctl -p warning..alert -b
+```
 
-- [ ] I have read and understood all disclaimers
-- [ ] I have complete, tested backups of all data
-- [ ] I have tested this script in a development environment
-- [ ] I have a maintenance window scheduled
-- [ ] I have console access to the server
-- [ ] I understand the risks of major system upgrades
-- [ ] I accept full responsibility for any consequences
+Clear or hard-refresh the browser cache before using the web UI after the upgrade.
 
-### Emergency Contacts
+## Known Issues to Review
 
-- **Proxmox Support:** (If you have a subscription)
-- **Your System Administrator**
-- **Your Backup/Disaster Recovery Team**
+Read the official known issues before running an in-place upgrade. Pay particular attention to:
 
----
+- `linux-image-amd64` conflicts on Debian-installed hosts.
+- `systemd-boot` meta-package behavior on PVE-managed boot setups.
+- UEFI + LVM GRUB boot handling.
+- cgroup v1 removal for old containers.
+- NVIDIA vGPU driver compatibility.
+- Veeam limitations with QEMU machine version 10.0 or newer.
+- PCI passthrough behavior with newer kernels.
+- Backports and third-party repositories.
+- Third-party storage plugins.
 
-## 🙏 Acknowledgments
+## Development
 
-- Based on official Proxmox VE upgrade documentation
-- Inspired by community feedback and real-world usage
-- Special thanks to the Proxmox development team
+Local checks:
 
----
+```bash
+bash -n ProxmoxVE8to9.sh
+```
 
-**Remember: When in doubt, don't upgrade. A working Proxmox VE 8.x system is better than a broken Proxmox VE 9.x system.**
+CI runs ShellCheck on pull requests and pushes.
 
-## 📊 Version Compatibility Matrix
+## License
 
-| Script Version | Proxmox VE Source | Proxmox VE Target | Debian Source | Debian Target | Status |
-|----------------|-------------------|-------------------|---------------|---------------|---------|
-| 1.0.0          | 8.4.x            | 9.0.x            | Bookworm      | Trixie        | ✅ Stable |
-
----
-
-*Last updated: $(date +'%Y-%m-%d')*
+MIT. See [LICENSE](LICENSE).

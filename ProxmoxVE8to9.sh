@@ -1,611 +1,551 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Proxmox VE 8 to 9 Upgrade Script
-# Based on official upgrade documentation: https://pve.proxmox.com/wiki/Upgrade_from_8_to_9
-# 
-# WARNING: This script performs a major system upgrade
-# Test in lab environment before running on production systems
-#
-# License: MIT
-# Repository: https://github.com/your-username/proxmox-upgrade-scripts
-# 
-# Usage: ./proxmox-8to9-upgrade.sh
-# 
-# Prerequisites:
-# - Proxmox VE 8.x installation
-# - Root access
-# - Network connectivity
-# - Complete backups of VMs, containers, and configurations
+# Proxmox VE 8 to 9 upgrade helper.
+# Primary reference: https://pve.proxmox.com/wiki/Upgrade_from_8_to_9
 
-set -e
+set -Eeuo pipefail
 
-# Script version
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0"
+TARGET_SUITE="trixie"
+SOURCE_SUITE="bookworm"
+LOG_FILE="/var/log/pve8to9-upgrade-helper.log"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+ASSUME_YES=0
+CHECK_ONLY=0
+NO_REBOOT=0
+PVE_REPO="prompt"
+CEPH_REPO="auto"
 
-# Logging function
+if [[ -t 1 ]]; then
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[1;33m'
+  BLUE=$'\033[0;34m'
+  NC=$'\033[0m'
+else
+  RED=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  NC=""
+fi
+
+usage() {
+  cat <<EOF
+Usage: sudo ./ProxmoxVE8to9.sh [options]
+
+Options:
+  --check-only                  Run readiness checks without changing repositories or packages.
+  --yes                         Assume yes for this helper's prompts. apt remains interactive.
+  --pve-repo enterprise|no-subscription
+                                Select the Proxmox VE 9 repository to write in deb822 format.
+  --ceph-repo auto|enterprise|no-subscription|none
+                                Select the Ceph Squid repository behavior. Default: auto.
+  --no-reboot                   Do not offer to reboot at the end.
+  -h, --help                    Show this help.
+
+Examples:
+  sudo ./ProxmoxVE8to9.sh --check-only
+  sudo ./ProxmoxVE8to9.sh --pve-repo enterprise --ceph-repo enterprise
+  sudo ./ProxmoxVE8to9.sh --pve-repo no-subscription --ceph-repo auto
+EOF
+}
+
 log() {
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
+  local message="$1"
+  echo "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} ${message}" | tee -a "$LOG_FILE"
 }
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    exit 1
-}
-
-warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+warn() {
+  local message="$1"
+  echo "${YELLOW}[WARN]${NC} ${message}" | tee -a "$LOG_FILE" >&2
 }
 
 success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+  local message="$1"
+  echo "${GREEN}[OK]${NC} ${message}" | tee -a "$LOG_FILE"
 }
 
-# Function to prompt for user confirmation
+die() {
+  local message="$1"
+  echo "${RED}[ERROR]${NC} ${message}" | tee -a "$LOG_FILE" >&2
+  exit 1
+}
+
 confirm() {
-    read -p "$1 (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        log "Operation cancelled by user"
-        exit 1
-    fi
+  local prompt="$1"
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    log "${prompt} yes"
+    return 0
+  fi
+
+  read -r -p "${prompt} [y/N]: " reply
+  [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# Check if running as root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root"
-    fi
+run() {
+  log "+ $*"
+  "$@"
 }
 
-# Check current PVE version
-check_pve_version() {
-    log "Checking current Proxmox VE version..."
-    
-    if ! command -v pveversion &> /dev/null; then
-        error "pveversion command not found. Is this a Proxmox VE system?"
-    fi
-    
-    local version=$(pveversion | head -n1 | grep -oP 'pve-manager/\K[0-9]+\.[0-9]+')
-    log "Current PVE version: $version"
-    
-    if [[ $version =~ ^9\. ]]; then
-        warning "System is already on PVE 9.x (version $version)"
-        confirm "Do you want to continue with post-upgrade verification and fixes?"
-        return 0
-    elif [[ $version =~ ^8\. ]]; then
-        log "PVE 8.x detected, proceeding with upgrade"
-        return 0
-    else
-        error "Unsupported PVE version: $version. This script supports upgrading from 8.x to 9.x"
-    fi
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --check-only)
+        CHECK_ONLY=1
+        shift
+        ;;
+      --yes)
+        ASSUME_YES=1
+        shift
+        ;;
+      --pve-repo)
+        PVE_REPO="${2:-}"
+        shift 2
+        ;;
+      --ceph-repo)
+        CEPH_REPO="${2:-}"
+        shift 2
+        ;;
+      --no-reboot)
+        NO_REBOOT=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  case "$PVE_REPO" in
+    prompt|enterprise|no-subscription) ;;
+    *) die "--pve-repo must be enterprise or no-subscription" ;;
+  esac
+
+  case "$CEPH_REPO" in
+    auto|enterprise|no-subscription|none) ;;
+    *) die "--ceph-repo must be auto, enterprise, no-subscription, or none" ;;
+  esac
 }
 
-# Check system requirements
-check_requirements() {
-    log "Checking system requirements..."
-    
-    # Check disk space
-    local root_space=$(df / | awk 'NR==2 {print $4}')
-    local root_space_gb=$((root_space / 1024 / 1024))
-    
-    if [[ $root_space_gb -lt 5 ]]; then
-        error "Insufficient disk space. Need at least 5GB free on root filesystem. Available: ${root_space_gb}GB"
-    fi
-    
-    success "Disk space check passed: ${root_space_gb}GB available"
-    
-    # Check if tmux is available
-    if ! command -v tmux &> /dev/null; then
-        log "Installing tmux for session persistence..."
-        apt update
-        apt install -y tmux
-    fi
-    
-    # Check for active cluster
-    if [[ -f /etc/pve/cluster.conf ]] || [[ -f /etc/corosync/corosync.conf ]]; then
-        warning "Cluster detected. Ensure you upgrade nodes one by one!"
-        confirm "Do you want to continue with cluster node upgrade?"
-    fi
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
 }
 
-# Pre-flight environment check
-preflight_check() {
-    log "Performing pre-flight environment checks..."
-    
-    # Check network connectivity
-    if ! ping -c 1 download.proxmox.com &>/dev/null; then
-        error "Cannot reach download.proxmox.com - check network connectivity"
-    fi
-    
-    # Check DNS resolution
-    if ! nslookup download.proxmox.com &>/dev/null; then
-        warning "DNS resolution issues detected - this might cause package download problems"
-    fi
-    
-    # Check if this is a VM (not recommended for production)
-    if [[ -f /sys/class/dmi/id/product_name ]] && grep -qi "virtual\|vmware\|qemu\|kvm" /sys/class/dmi/id/product_name; then
-        warning "Running on virtual machine - ensure you have VM snapshots as backup"
-    fi
-    
-    # Check available entropy (low entropy can slow down the upgrade)
-    local entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || echo "0")
-    if [[ $entropy -lt 200 ]]; then
-        warning "Low system entropy ($entropy) - upgrade may be slower"
-    fi
-    
-    # Check system load
-    local load=$(uptime | grep -oP 'load average: \K[0-9.]+' | head -1)
-    local load_int=${load%.*}  # Get integer part
-    if command -v bc &>/dev/null; then
-        if (( $(echo "$load > 2.0" | bc -l) )); then
-            warning "High system load ($load) - consider waiting for lower load before upgrade"
-        fi
-    elif [[ $load_int -gt 2 ]]; then
-        warning "High system load ($load) - consider waiting for lower load before upgrade"
-    fi
-    
-    success "Pre-flight checks completed"
+require_proxmox() {
+  command -v pveversion >/dev/null 2>&1 || die "pveversion not found. This does not look like a Proxmox VE host."
 }
 
-# Backup reminder
-backup_reminder() {
-    cat << 'EOF'
+version_major() {
+  pveversion | awk -F'/' '/pve-manager/ { split($2, v, "."); print v[1]; exit }'
+}
 
-╔══════════════════════════════════════════════════════════════╗
-║                        BACKUP REMINDER                      ║
-╠══════════════════════════════════════════════════════════════╣
-║ Before proceeding, ensure you have backed up:               ║
-║                                                              ║
-║ • All VMs and containers (vzdump)                          ║
-║ • Configuration files in /etc/pve/                         ║
-║ • Network configuration (/etc/network/interfaces)          ║
-║ • Custom configurations                                     ║
-║ • Test restore procedures                                   ║
-║                                                              ║
-║ Recommended: Take a snapshot of the host system if possible ║
-╚══════════════════════════════════════════════════════════════╝
+version_full() {
+  pveversion | awk -F'/' '/pve-manager/ { split($2, v, " "); print v[1]; exit }'
+}
+
+check_starting_version() {
+  local major full
+  major="$(version_major)"
+  full="$(version_full)"
+  log "Detected Proxmox VE pve-manager version: ${full:-unknown}"
+
+  case "$major" in
+    8) ;;
+    9)
+      warn "This host is already on Proxmox VE 9. The helper will only run verification unless you continue manually."
+      ;;
+    *)
+      die "Unsupported Proxmox VE major version '${major:-unknown}'. This helper only supports PVE 8 to 9."
+      ;;
+  esac
+}
+
+check_disk_space() {
+  local available_kib available_gib
+  available_kib="$(df --output=avail / | awk 'NR==2 {print $1}')"
+  available_gib=$((available_kib / 1024 / 1024))
+
+  if (( available_gib < 5 )); then
+    die "At least 5 GiB free on / is required; found ${available_gib} GiB."
+  fi
+
+  if (( available_gib < 10 )); then
+    warn "Only ${available_gib} GiB free on /. Proxmox recommends 5 GiB minimum, ideally more than 10 GiB."
+  else
+    success "Root filesystem has ${available_gib} GiB free."
+  fi
+}
+
+check_console_and_session() {
+  if [[ -n "${SSH_TTY:-}" ]] && [[ -z "${TMUX:-}" && -z "${STY:-}" ]]; then
+    warn "SSH session detected without tmux/screen. Proxmox recommends a terminal multiplexer for SSH upgrades."
+  fi
+
+  if [[ -n "${PVE_GENERATING_DOCS:-}" ]]; then
+    return 0
+  fi
+
+  if ! confirm "Confirm you have console/IPMI/physical access or an SSH session protected by tmux/screen."; then
+    die "Console/session access was not confirmed."
+  fi
+}
+
+check_backups() {
+  cat <<EOF
+
+Before continuing, confirm you have current, tested backups:
+  - all VMs and containers
+  - /etc/pve
+  - /etc/network/interfaces and other host-specific /etc files
+  - storage, firewall, and cluster configuration needed for recovery
 
 EOF
 
-    confirm "Have you completed all necessary backups?"
+  if ! confirm "Confirm backups are complete and restore-tested."; then
+    die "Backups were not confirmed."
+  fi
 }
 
-# Upgrade to latest PVE 8.4.x
-upgrade_to_latest_8() {
-    log "Upgrading to latest PVE 8.4.x..."
-    
-    # Check current version before upgrade
-    local current_version=$(pveversion | head -n1 | grep -oP 'pve-manager/\K[0-9]+\.[0-9]+')
-    
-    # Skip if already on PVE 9.x
-    if [[ $current_version =~ ^9\. ]]; then
-        log "Already on PVE 9.x (version $current_version), skipping 8.4.x upgrade"
-        return 0
+check_cluster() {
+  if [[ -f /etc/corosync/corosync.conf ]]; then
+    warn "Cluster configuration detected. Upgrade one node at a time and keep the cluster healthy between nodes."
+    run pvecm status || warn "pvecm status reported issues. Resolve cluster health before upgrading."
+    if ! confirm "Confirm this node has been drained/migrated as needed and the cluster is healthy."; then
+      die "Cluster readiness was not confirmed."
     fi
-    
-    apt update
-    apt dist-upgrade -y
-    
-    # Check version after upgrade
-    local new_version=$(pveversion | head -n1 | grep -oP 'pve-manager/\K[0-9]+\.[0-9]+\.[0-9]+')
-    log "Updated to PVE version: $new_version"
-    
-    # Accept either 8.4.x or 9.x as valid
-    if [[ $new_version =~ ^8\.4\. ]] || [[ $new_version =~ ^9\. ]]; then
-        success "Successfully updated PVE (version: $new_version)"
-    else
-        error "Unexpected version after upgrade: $new_version"
-    fi
+  fi
 }
 
-# Run pre-upgrade checklist and preparation
-run_checklist() {
-    log "Running pre-upgrade checklist and preparation..."
-    
-    # Run pve8to9 checklist if available
-    if command -v pve8to9 &> /dev/null; then
-        log "Running pve8to9 checklist..."
-        if pve8to9 --full; then
-            success "Pre-upgrade checklist passed"
-        else
-            warning "Pre-upgrade checklist found issues - review output above"
-        fi
-        confirm "Review the checklist output above. Do you want to continue?"
-    else
-        warning "pve8to9 checklist script not found. Installing it..."
-        apt update
-        apt install -y pve-manager
-        if command -v pve8to9 &> /dev/null; then
-            log "Running pve8to9 checklist..."
-            pve8to9 --full
-            confirm "Review the checklist output above. Do you want to continue?"
-        else
-            warning "Could not install pve8to9. Proceeding without automated checks."
-        fi
-    fi
-    
-    # Additional safety checks
-    log "Performing additional safety checks..."
-    
-    # Check for custom repository configurations that might cause issues
-    if find /etc/apt/sources.list.d/ -name "*.list" -type f | xargs grep -l "bookworm" 2>/dev/null; then
-        warning "Found repository files still pointing to 'bookworm' - these will be updated"
-    fi
-    
-    # Check for running VMs/containers
-    local running_vms=$(qm list 2>/dev/null | grep running | wc -l || echo "0")
-    local running_cts=$(pct list 2>/dev/null | grep running | wc -l || echo "0")
-    
-    if [[ $running_vms -gt 0 ]] || [[ $running_cts -gt 0 ]]; then
-        warning "Found $running_vms running VMs and $running_cts running containers"
-        warning "Consider stopping non-essential services before major upgrade"
-        confirm "Do you want to continue with running VMs/containers?"
-    fi
+check_ceph() {
+  if ! command -v ceph >/dev/null 2>&1; then
+    log "Ceph command not found; skipping Ceph version check."
+    return 0
+  fi
+
+  local ceph_version ceph_major
+  ceph_version="$(ceph --version 2>/dev/null || true)"
+  ceph_major="$(awk '{print $3}' <<<"$ceph_version" | cut -d. -f1)"
+
+  if [[ -z "$ceph_version" ]]; then
+    warn "Ceph is installed but version could not be detected. Verify manually before upgrading."
+    return 0
+  fi
+
+  log "Detected ${ceph_version}"
+
+  if [[ "$ceph_major" != "19" ]]; then
+    die "Hyper-converged Ceph must be upgraded to Ceph Squid 19.2 before PVE 9. Detected: ${ceph_version}"
+  fi
 }
 
-# Update repository configuration
-update_repositories() {
-    log "Updating repository configuration for Debian Trixie..."
-    
-    # Backup current sources
-    cp -r /etc/apt/sources.list.d /etc/apt/sources.list.d.backup.$(date +%Y%m%d)
-    [[ -f /etc/apt/sources.list ]] && cp /etc/apt/sources.list /etc/apt/sources.list.backup.$(date +%Y%m%d)
-    
-    # Update main Debian repository
-    if [[ -f /etc/apt/sources.list ]]; then
-        sed -i 's/bookworm/trixie/g' /etc/apt/sources.list
+run_pve8to9() {
+  if ! command -v pve8to9 >/dev/null 2>&1; then
+    die "pve8to9 not found. Update to the latest Proxmox VE 8.4 packages first, then rerun this helper."
+  fi
+
+  log "Running pve8to9 --full. Review all warnings before continuing."
+  if pve8to9 --full | tee -a "$LOG_FILE"; then
+    success "pve8to9 --full completed."
+  else
+    warn "pve8to9 --full reported issues."
+  fi
+
+  if ! confirm "Confirm the pve8to9 output is understood and any blocking issues are fixed."; then
+    die "pve8to9 output was not accepted."
+  fi
+}
+
+upgrade_latest_8() {
+  if [[ "$(version_major)" != "8" ]]; then
+    return 0
+  fi
+
+  log "Updating current Proxmox VE 8 packages before repository migration."
+  run apt update
+  run apt dist-upgrade
+
+  local full
+  full="$(version_full)"
+  if [[ ! "$full" =~ ^8\.4\. ]]; then
+    die "Expected Proxmox VE 8.4.x before upgrading to 9.x; detected ${full:-unknown}."
+  fi
+
+  success "Host is on Proxmox VE ${full}."
+}
+
+select_repositories() {
+  if [[ "$PVE_REPO" == "prompt" ]]; then
+    echo
+    echo "Select the Proxmox VE 9 repository:"
+    echo "  1) enterprise (recommended for production with a valid subscription)"
+    echo "  2) no-subscription (community/testing use; no subscription required)"
+    read -r -p "Choice [1/2]: " choice
+    case "$choice" in
+      1) PVE_REPO="enterprise" ;;
+      2) PVE_REPO="no-subscription" ;;
+      *) die "Invalid repository choice." ;;
+    esac
+  fi
+
+  log "Selected PVE repository: ${PVE_REPO}"
+  log "Selected Ceph repository mode: ${CEPH_REPO}"
+}
+
+backup_apt_sources() {
+  local backup_dir="/root/pve8to9-apt-sources-backup-$(date '+%Y%m%d-%H%M%S')"
+  run mkdir -p "$backup_dir"
+
+  if [[ -f /etc/apt/sources.list ]]; then
+    run cp -a /etc/apt/sources.list "$backup_dir/"
+  fi
+
+  if [[ -d /etc/apt/sources.list.d ]]; then
+    run cp -a /etc/apt/sources.list.d "$backup_dir/"
+  fi
+
+  success "Backed up APT sources to ${backup_dir}."
+}
+
+comment_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  sed -i 's/^[[:space:]]*deb /# disabled by pve8to9 helper: deb /' "$file"
+}
+
+disable_legacy_pve_sources() {
+  local file
+  while IFS= read -r -d '' file; do
+    if grep -Eq 'enterprise\.proxmox\.com/debian/pve|download\.proxmox\.com/debian/pve' "$file"; then
+      log "Disabling legacy PVE repository entries in ${file}."
+      if [[ "$file" == *.sources ]]; then
+        run mv "$file" "${file}.disabled-by-pve8to9"
+      else
+        comment_file "$file"
+      fi
     fi
-    
-    # Update Proxmox VE repository
-    cat > /etc/apt/sources.list.d/pve-install-repo.sources << 'EOL'
+  done < <(find /etc/apt/sources.list /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+}
+
+replace_suite_in_apt_sources() {
+  local file
+  while IFS= read -r -d '' file; do
+    if grep -q "$SOURCE_SUITE" "$file"; then
+      log "Updating Debian suite names in ${file}."
+      sed -i "s/${SOURCE_SUITE}/${TARGET_SUITE}/g" "$file"
+    fi
+  done < <(find /etc/apt/sources.list /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+}
+
+write_pve_repository() {
+  case "$PVE_REPO" in
+    enterprise)
+      cat > /etc/apt/sources.list.d/pve-enterprise.sources <<EOF
+Types: deb
+URIs: https://enterprise.proxmox.com/debian/pve
+Suites: trixie
+Components: pve-enterprise
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+EOF
+      ;;
+    no-subscription)
+      cat > /etc/apt/sources.list.d/proxmox.sources <<EOF
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
 Suites: trixie
 Components: pve-no-subscription
 Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
-Architectures: amd64
-EOL
+EOF
+      ;;
+  esac
+}
 
-    # Update Ceph repository if it exists
-    if [[ -f /etc/apt/sources.list.d/ceph.sources ]]; then
-        log "Updating Ceph repository..."
-        cat > /etc/apt/sources.list.d/ceph.sources << 'EOL'
+ceph_repo_needed() {
+  command -v ceph >/dev/null 2>&1 || [[ -f /etc/apt/sources.list.d/ceph.list ]] || [[ -f /etc/apt/sources.list.d/ceph.sources ]]
+}
+
+write_ceph_repository() {
+  if [[ "$CEPH_REPO" == "none" ]]; then
+    log "Skipping Ceph repository changes by request."
+    return 0
+  fi
+
+  if [[ "$CEPH_REPO" == "auto" ]]; then
+    if ! ceph_repo_needed; then
+      log "No local Ceph installation/repository detected; skipping Ceph repository."
+      return 0
+    fi
+    CEPH_REPO="$PVE_REPO"
+  fi
+
+  case "$CEPH_REPO" in
+    enterprise)
+      cat > /etc/apt/sources.list.d/ceph.sources <<EOF
+Types: deb
+URIs: https://enterprise.proxmox.com/debian/ceph-squid
+Suites: trixie
+Components: enterprise
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+EOF
+      ;;
+    no-subscription)
+      cat > /etc/apt/sources.list.d/ceph.sources <<EOF
 Types: deb
 URIs: http://download.proxmox.com/debian/ceph-squid
 Suites: trixie
 Components: no-subscription
 Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
-EOL
-    fi
-    
-    # Download new keyring if needed
-    if [[ ! -f /usr/share/keyrings/proxmox-archive-keyring.gpg ]]; then
-        log "Downloading Proxmox archive keyring..."
-        wget --secure-protocol=TLSv1_2 --timeout=30 https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg -O /usr/share/keyrings/proxmox-archive-keyring.gpg
-        
-        # Verify keyring
-        local sha256_expected="136673be77aba35dcce385b28737689ad64fd785a797e57897589aed08db6e45"
-        local sha256_actual=$(sha256sum /usr/share/keyrings/proxmox-archive-keyring.gpg | cut -d' ' -f1)
-        
-        if [[ "$sha256_actual" != "$sha256_expected" ]]; then
-            error "Keyring verification failed. Expected: $sha256_expected, Got: $sha256_actual"
-        fi
-        
-        success "Keyring verified successfully"
-    fi
-    
-    success "Repository configuration updated"
-}
-
-# Perform the upgrade
-perform_upgrade() {
-    log "Starting upgrade to Proxmox VE 9.0..."
-    
-    # Update package lists
-    apt update
-    
-    # Remove conflicting packages if they exist
-    if dpkg -l | grep -q linux-image-amd64; then
-        log "Removing conflicting linux-image-amd64 package..."
-        apt remove -y linux-image-amd64
-    fi
-    
-    # Remove systemd-boot meta-package if present
-    if dpkg -l | grep -q "^ii.*systemd-boot[[:space:]]"; then
-        log "Removing systemd-boot meta-package..."
-        apt remove -y systemd-boot
-    fi
-    
-    # Perform the main upgrade with proper error handling
-    log "Performing dist-upgrade (this may take a while)..."
-    
-    # Set debconf to non-interactive mode with fallback to old config
-    export DEBIAN_FRONTEND=noninteractive
-    export DEBIAN_PRIORITY=critical
-    
-    # Perform upgrade with better error handling
-    if apt dist-upgrade -y; then
-        success "Package upgrade completed successfully"
-    else
-        local exit_code=$?
-        if [[ $exit_code -eq 0 ]]; then
-            success "Package upgrade completed"
-        else
-            warning "Upgrade completed with warnings (exit code: $exit_code)"
-            log "Continuing with post-upgrade steps..."
-        fi
-    fi
-    
-    # Check if we ended up on PVE 9.x after the upgrade
-    local new_version=$(pveversion 2>/dev/null | head -n1 | grep -oP 'pve-manager/\K[0-9]+\.[0-9]+' || echo "unknown")
-    log "Version after upgrade: $new_version"
-    
-    if [[ $new_version =~ ^9\. ]]; then
-        success "Successfully upgraded to PVE 9.x (version $new_version)"
-    elif [[ $new_version == "unknown" ]]; then
-        warning "Could not determine PVE version after upgrade - will verify later"
-    else
-        warning "Unexpected version after upgrade: $new_version - continuing with kernel installation"
-    fi
-}
-
-# Install and configure PVE 9 kernel
-install_pve_kernel() {
-    log "Installing and configuring Proxmox VE 9 kernel..."
-    
-    # Install the new kernel if not already present
-    if ! dpkg -l | grep -q "proxmox-kernel-6.14"; then
-        apt install -y proxmox-kernel-6.14
-    fi
-    
-    # Ensure the new kernel is default
-    if [[ -f /etc/default/grub ]]; then
-        log "Updating GRUB configuration..."
-        update-grub
-    fi
-    
-    # Check available kernels
-    log "Available kernels after installation:"
-    ls -la /boot/vmlinuz-* | grep -E "(6\.14|6\.8)" | sort -V
-    
-    success "PVE 9 kernel installed and configured"
-}
-
-# Fix UEFI boot issues
-fix_uefi_boot() {
-    log "Checking for UEFI boot configuration issues..."
-    
-    # Check if system is UEFI
-    if [[ -d /sys/firmware/efi ]]; then
-        log "UEFI system detected, checking GRUB configuration..."
-        
-        # Fix GRUB EFI configuration for removable media
-        if [[ -f /boot/efi/EFI/BOOT/BOOTX64.efi ]] && ! dpkg-query -W grub-efi-amd64 | grep -q "install ok"; then
-            log "Fixing GRUB EFI configuration..."
-            echo 'grub-efi-amd64 grub2/force_efi_extra_removable boolean true' | debconf-set-selections -v
-            apt install --reinstall grub-efi-amd64 -y
-            success "GRUB EFI configuration fixed"
-        fi
-        
-        # Install correct grub meta-package for EFI with LVM
-        if [[ -d /sys/firmware/efi ]] && mountpoint -q /boot/efi; then
-            apt install grub-efi-amd64 -y
-        fi
-    fi
-}
-
-# Post-upgrade verification
-verify_upgrade() {
-    log "Verifying upgrade..."
-    
-    # Check PVE version
-    local pve_version=$(pveversion 2>/dev/null | head -n1 | grep -oP 'pve-manager/\K[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-    log "Current PVE version: $pve_version"
-    
-    # Check current kernel
-    local current_kernel=$(uname -r)
-    log "Currently running kernel: $current_kernel"
-    
-    # Check available kernels
-    local new_kernel_available=$(ls /boot/vmlinuz-* 2>/dev/null | grep -o "6\.14\.[0-9]*-[0-9]*-pve" | head -n1 || echo "none")
-    log "New PVE 9 kernel available: $new_kernel_available"
-    
-    # Verify PVE version
-    if [[ $pve_version =~ ^9\. ]]; then
-        success "Successfully upgraded to Proxmox VE 9.x (version: $pve_version)"
-    elif [[ $pve_version == "unknown" ]]; then
-        warning "Could not determine PVE version - manual verification required"
-    else
-        warning "Unexpected PVE version: $pve_version"
-    fi
-    
-    # Check kernel status
-    if [[ $current_kernel =~ 6\.14.*-pve ]]; then
-        success "Already running new PVE 9 kernel: $current_kernel"
-    elif [[ $new_kernel_available != "none" ]]; then
-        warning "New kernel ($new_kernel_available) is available but not running ($current_kernel)"
-        warning "Reboot is required to complete the upgrade"
-    else
-        warning "No PVE 9 kernel found - this may indicate an incomplete upgrade"
-    fi
-    
-    # Fix any UEFI boot issues
-    fix_uefi_boot
-    
-    # Check if reboot is required
-    local reboot_required=false
-    
-    if [[ -f /var/run/reboot-required ]]; then
-        reboot_required=true
-    fi
-    
-    if [[ ! $current_kernel =~ 6\.14.*-pve ]] && [[ $new_kernel_available != "none" ]]; then
-        reboot_required=true
-    fi
-    
-    if [[ $reboot_required == true ]]; then
-        cat << 'EOF'
-
-╔══════════════════════════════════════════════════════════════╗
-║                     REBOOT REQUIRED                         ║
-╠══════════════════════════════════════════════════════════════╣
-║ A system reboot is required to complete the upgrade:        ║
-║                                                              ║
-║ • Load the new PVE 9 kernel (6.14.x)                      ║
-║ • Activate GRUB configuration changes                       ║
-║ • Complete systemd service updates                          ║
-║                                                              ║
-║ After reboot, verify with: uname -r && pveversion          ║
-╚══════════════════════════════════════════════════════════════╝
-
 EOF
-        confirm "Do you want to reboot now to complete the upgrade?"
-        log "Rebooting system..."
-        reboot
+      ;;
+  esac
+
+  if [[ -f /etc/apt/sources.list.d/ceph.list ]]; then
+    log "Disabling legacy Ceph list repository."
+    comment_file /etc/apt/sources.list.d/ceph.list
+  fi
+}
+
+disable_backports() {
+  local file
+  while IFS= read -r -d '' file; do
+    if grep -Eq '^[[:space:]]*deb .*backports' "$file"; then
+      warn "Disabling backports repository in ${file}; Proxmox does not test this upgrade with backports."
+      sed -i 's/^[[:space:]]*deb \(.*backports.*\)$/# disabled by pve8to9 helper: deb \1/' "$file"
+    fi
+  done < <(find /etc/apt/sources.list /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+}
+
+configure_repositories() {
+  select_repositories
+  backup_apt_sources
+  replace_suite_in_apt_sources
+  disable_legacy_pve_sources
+  write_pve_repository
+  write_ceph_repository
+  disable_backports
+  success "Repository files updated for Debian Trixie / Proxmox VE 9."
+}
+
+pre_upgrade_known_issue_checks() {
+  if dpkg-query -W -f='${Status}\n' linux-image-amd64 2>/dev/null | grep -q 'install ok installed'; then
+    warn "linux-image-amd64 is installed. Official docs say it can conflict with current PVE 9 setups."
+    if confirm "Remove linux-image-amd64 now?"; then
+      run apt remove linux-image-amd64
     else
-        success "No reboot required - upgrade is complete"
+      die "Remove linux-image-amd64 manually before dist-upgrade."
     fi
+  fi
+
+  if dpkg-query -W -f='${Status}\n' systemd-boot 2>/dev/null | grep -q 'install ok installed'; then
+    warn "systemd-boot meta-package is installed. pve8to9 may recommend removing it for PVE-managed boot setups."
+  fi
+
+  if systemctl list-unit-files systemd-journald-audit.socket >/dev/null 2>&1; then
+    warn "Debian Trixie can emit excessive audit logs during upgrade if systemd-journald-audit.socket stays enabled."
+    if confirm "Disable and stop systemd-journald-audit.socket before upgrade?"; then
+      run systemctl disable --now systemd-journald-audit.socket || warn "Could not disable systemd-journald-audit.socket."
+    fi
+  fi
 }
 
-# Cleanup function
-cleanup() {
-    log "Performing cleanup..."
-    apt autoremove -y
-    apt autoclean
-    
-    # Remove subscription nag if present
-    if [[ -f /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ]]; then
-        log "Removing subscription nag from UI..."
-        sed -i.backup -e "s/data.status !== 'Active'/false/g" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
-        systemctl restart pveproxy
-    fi
-    
-    success "Cleanup completed"
+perform_distribution_upgrade() {
+  log "Refreshing package indexes against Trixie repositories."
+  run apt update
+  run apt policy
+
+  if ! confirm "Confirm apt update/policy output is clean and shows only intended Bookworm/Trixie transition repositories."; then
+    die "Repository verification was not confirmed."
+  fi
+
+  pre_upgrade_known_issue_checks
+
+  log "Starting apt dist-upgrade. Keep this interactive so package conffile prompts can be answered deliberately."
+  run apt dist-upgrade
 }
 
-# Main execution
+post_upgrade_checks() {
+  log "Running pve8to9 after dist-upgrade."
+  if command -v pve8to9 >/dev/null 2>&1; then
+    pve8to9 --full | tee -a "$LOG_FILE" || warn "pve8to9 still reports issues after upgrade."
+  else
+    warn "pve8to9 is not available after upgrade."
+  fi
+
+  log "Current pveversion output:"
+  pveversion | tee -a "$LOG_FILE" || true
+
+  log "Current kernel: $(uname -r)"
+
+  if [[ -d /sys/firmware/efi ]]; then
+    log "UEFI boot detected."
+    if mountpoint -q /boot/efi && findmnt -n -o SOURCE / | grep -qi lvm; then
+      warn "UEFI with root on LVM detected. Official docs recommend ensuring grub-efi-amd64 is installed."
+      if confirm "Install grub-efi-amd64 now?"; then
+        run apt install grub-efi-amd64
+      fi
+    fi
+  fi
+
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "A reboot is required."
+  else
+    warn "A reboot is still recommended after a major Proxmox VE upgrade to load the PVE 9 kernel and services."
+  fi
+
+  if [[ "$NO_REBOOT" -eq 0 ]] && confirm "Reboot now?"; then
+    run reboot
+  else
+    log "Reboot skipped. Reboot manually before considering the upgrade complete."
+  fi
+}
+
 main() {
-    cat << EOF
-╔══════════════════════════════════════════════════════════════╗
-║                Proxmox VE 8 to 9 Upgrade Script             ║
-║                        Version $SCRIPT_VERSION                        ║
-║                                                              ║
-║  WARNING: This performs a major system upgrade              ║
-║  Ensure you have backups and tested in lab environment      ║
-║                                                              ║
-║  Based on: https://pve.proxmox.com/wiki/Upgrade_from_8_to_9 ║
-╚══════════════════════════════════════════════════════════════╝
+  parse_args "$@"
+  require_root
+  touch "$LOG_FILE"
 
+  cat <<EOF
+Proxmox VE 8 to 9 Upgrade Helper v${SCRIPT_VERSION}
+
+This helper follows the official Proxmox 8-to-9 flow:
+  1. update to the latest PVE 8.4 packages
+  2. run pve8to9 --full
+  3. migrate APT repositories to Debian Trixie / PVE 9 deb822 sources
+  4. run apt dist-upgrade interactively
+  5. run pve8to9 --full again and reboot
+
+Log: ${LOG_FILE}
 EOF
 
-    confirm "Do you want to proceed with the Proxmox VE upgrade/verification process?"
-    
-    log "Starting Proxmox VE upgrade/verification process..."
-    
-    check_root
-    check_pve_version
-    
-    # Get current version to determine what to do
-    local current_version=$(pveversion | head -n1 | grep -oP 'pve-manager/\K[0-9]+\.[0-9]+')
-    
-    if [[ $current_version =~ ^9\. ]]; then
-        log "System already on PVE 9.x, running post-upgrade verification and fixes..."
-        fix_uefi_boot
-        cleanup
-        verify_upgrade
-    else
-        log "Starting full upgrade process from PVE 8.x to 9.x..."
-        preflight_check
-        check_requirements
-        backup_reminder
-        upgrade_to_latest_8
-        run_checklist
-        update_repositories
-        perform_upgrade
-        install_pve_kernel
-        cleanup
-        verify_upgrade
-    fi
-    
-    cat << 'EOF'
+  require_proxmox
+  check_starting_version
+  check_disk_space
+  check_console_and_session
+  check_backups
+  check_cluster
+  check_ceph
 
-╔══════════════════════════════════════════════════════════════╗
-║                    PROCESS COMPLETED                        ║
-╠══════════════════════════════════════════════════════════════╣
-║ Post-upgrade verification tasks:                            ║
-║                                                              ║
-║ 1. Clear browser cache and reload web interface             ║
-║    • Press Ctrl+Shift+R in your browser                    ║
-║    • Or manually clear cache and reload                     ║
-║                                                              ║
-║ 2. Verify system status:                                    ║
-║    • uname -r          (should show 6.14.x-pve)           ║
-║    • pveversion        (should show 9.x.x)                 ║
-║    • systemctl status pve-cluster pvedaemon pveproxy       ║
-║                                                              ║
-║ 3. Test VMs and containers:                                 ║
-║    • qm list && pct list                                    ║
-║    • Start any stopped VMs/containers                       ║
-║    • Test network connectivity                              ║
-║                                                              ║
-║ 4. Review logs for any issues:                             ║
-║    • journalctl -xe                                         ║
-║    • Check /var/log/syslog for any errors                  ║
-║                                                              ║
-║ 5. For clusters: Upgrade remaining nodes one by one        ║
-║                                                              ║
-║ 6. Update any custom configurations for Debian Trixie      ║
-╚══════════════════════════════════════════════════════════════╝
+  if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    run_pve8to9
+    success "Check-only mode completed. No repository or package changes were made by this helper."
+    exit 0
+  fi
 
-EOF
+  if [[ "$(version_major)" == "9" ]]; then
+    post_upgrade_checks
+    exit 0
+  fi
 
-    success "Proxmox VE process completed successfully!"
+  upgrade_latest_8
+  run_pve8to9
+  configure_repositories
+  perform_distribution_upgrade
+  post_upgrade_checks
+  success "Upgrade helper completed. Clear the browser cache and verify the web UI after reboot."
 }
 
-# Error handling
-trap 'handle_error $? $LINENO' ERR
-
-handle_error() {
-    local exit_code=$1
-    local line_number=$2
-    
-    cat << EOF
-
-╔══════════════════════════════════════════════════════════════╗
-║                        ERROR OCCURRED                       ║
-╠══════════════════════════════════════════════════════════════╣
-║ Exit code: $exit_code at line: $line_number                 ║
-║                                                              ║
-║ Recovery steps:                                              ║
-║                                                              ║
-║ 1. Check current system status:                             ║
-║    • pveversion                                              ║
-║    • uname -r                                                ║
-║    • systemctl status pve-cluster pvedaemon pveproxy        ║
-║                                                              ║
-║ 2. If partially upgraded:                                   ║
-║    • apt update && apt dist-upgrade                         ║
-║    • apt install --reinstall grub-efi-amd64                 ║
-║    • reboot if new kernel available                         ║
-║                                                              ║
-║ 3. If system is broken:                                     ║
-║    • Boot from rescue media                                 ║
-║    • Restore from backups                                   ║
-║                                                              ║
-║ 4. Check logs: journalctl -xe                              ║
-╚══════════════════════════════════════════════════════════════╝
-
-EOF
-    
-    error "Script failed. See recovery steps above."
-}
-
-# Run main function
 main "$@"
