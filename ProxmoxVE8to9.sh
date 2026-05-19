@@ -297,7 +297,8 @@ select_repositories() {
 }
 
 backup_apt_sources() {
-  local backup_dir="/root/pve8to9-apt-sources-backup-$(date '+%Y%m%d-%H%M%S')"
+  local backup_dir
+  backup_dir="/root/pve8to9-apt-sources-backup-$(date '+%Y%m%d-%H%M%S')"
   run mkdir -p "$backup_dir"
 
   if [[ -f /etc/apt/sources.list ]]; then
