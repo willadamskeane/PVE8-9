@@ -104,6 +104,46 @@ EOF
   assert_file_contains "${APT_SOURCES_DIR}/vendor.sources.disabled-by-pve8to9" '^Suites: bookworm$'
 }
 
+test_mixed_list_only_rewrites_debian_sources() {
+  reset_fixture "mixed-list-third-party"
+  load_script
+
+  cat > "$APT_SOURCES_LIST" <<'EOF'
+deb http://deb.debian.org/debian bookworm main contrib
+deb https://packages.example.invalid/debian bookworm main
+deb http://security.debian.org/debian-security bookworm-security main contrib
+EOF
+
+  replace_debian_suite_in_apt_sources
+
+  assert_file_contains "$APT_SOURCES_LIST" '^deb http://deb\.debian\.org/debian trixie main contrib$'
+  assert_file_contains "$APT_SOURCES_LIST" '^deb https://packages\.example\.invalid/debian bookworm main$'
+  assert_file_contains "$APT_SOURCES_LIST" '^deb http://security\.debian\.org/debian-security trixie-security main contrib$'
+}
+
+test_mixed_deb822_only_rewrites_debian_stanzas() {
+  reset_fixture "mixed-deb822-third-party"
+  load_script
+
+  cat > "${APT_SOURCES_DIR}/mixed.sources" <<'EOF'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: bookworm bookworm-updates
+Components: main contrib
+
+Types: deb
+URIs: https://packages.example.invalid/debian
+Suites: bookworm
+Components: main
+EOF
+
+  replace_debian_suite_in_apt_sources
+
+  assert_file_contains "${APT_SOURCES_DIR}/mixed.sources" '^Suites: trixie trixie-updates$'
+  assert_file_contains "${APT_SOURCES_DIR}/mixed.sources" '^Suites: bookworm$'
+  assert_file_contains "${APT_SOURCES_DIR}/mixed.sources" '^URIs: https://packages\.example\.invalid/debian$'
+}
+
 test_deb822_backports_is_disabled() {
   reset_fixture "deb822-backports"
   load_script
@@ -264,6 +304,8 @@ main() {
   local tests=(
     test_third_party_bookworm_list_is_disabled_not_rewritten
     test_third_party_bookworm_deb822_is_moved_not_rewritten
+    test_mixed_list_only_rewrites_debian_sources
+    test_mixed_deb822_only_rewrites_debian_stanzas
     test_deb822_backports_is_disabled
     test_mixed_list_only_disables_legacy_pve_lines
     test_mixed_deb822_only_disables_legacy_pve_stanza

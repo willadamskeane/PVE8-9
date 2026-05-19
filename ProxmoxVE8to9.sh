@@ -362,6 +362,25 @@ comment_matching_list_lines() {
   rm -f "$tmp"
 }
 
+replace_matching_list_lines() {
+  local file="$1"
+  local pattern="$2"
+  local search="$3"
+  local replacement="$4"
+  local tmp
+
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+  awk -v pattern="$pattern" -v search="$search" -v replacement="$replacement" '
+    /^[[:space:]]*deb[[:space:]]/ && $0 ~ pattern {
+      gsub(search, replacement)
+    }
+    { print }
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
 apt_source_files() {
   [[ -f "$APT_SOURCES_LIST" ]] && printf '%s\0' "$APT_SOURCES_LIST"
   [[ -d "$APT_SOURCES_DIR" ]] && find "$APT_SOURCES_DIR" -type f \( -name '*.list' -o -name '*.sources' \) -print0
@@ -418,6 +437,32 @@ disable_matching_deb822_stanzas() {
   rm -f "$tmp"
 }
 
+replace_matching_deb822_stanzas() {
+  local file="$1"
+  local pattern="$2"
+  local search="$3"
+  local replacement="$4"
+  local tmp
+
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+
+  awk -v pattern="$pattern" -v search="$search" -v replacement="$replacement" '
+    BEGIN { RS = ""; ORS = "" }
+    {
+      stanza = $0
+      sub(/[[:space:]]+$/, "", stanza)
+      if (stanza ~ pattern) {
+        gsub(search, replacement, stanza)
+      }
+      print stanza "\n\n"
+    }
+  ' "$file" > "$tmp"
+
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
 disable_legacy_pve_sources() {
   local file
   local pve_repo_pattern='enterprise\.proxmox\.com/debian/pve|download\.proxmox\.com/debian/pve'
@@ -436,10 +481,16 @@ disable_legacy_pve_sources() {
 
 replace_debian_suite_in_apt_sources() {
   local file
+  local debian_repo_pattern='(^[[:space:]]*deb[[:space:]].*(debian\.org|debian\.net)/debian(-security)?([[:space:]]|/)|URIs:[[:space:]].*(debian\.org|debian\.net)/debian(-security)?)'
+
   while IFS= read -r -d '' file; do
     if grep -q "$SOURCE_SUITE" "$file" && is_official_debian_source "$file"; then
       log "Updating Debian suite names in ${file}."
-      sed_in_place "s/${SOURCE_SUITE}/${TARGET_SUITE}/g" "$file"
+      if [[ "$file" == *.sources ]]; then
+        replace_matching_deb822_stanzas "$file" "$debian_repo_pattern" "$SOURCE_SUITE" "$TARGET_SUITE"
+      else
+        replace_matching_list_lines "$file" "$debian_repo_pattern" "$SOURCE_SUITE" "$TARGET_SUITE"
+      fi
     fi
   done < <(apt_source_files)
 }
